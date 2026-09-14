@@ -86,6 +86,14 @@ PLAYER_UA = "VLC/3.0.20 LibVLC/3.0.20"  # panels 403 unknown agents; a player is
 DLNA_LIVE = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8D100000000000000000000000000000"
 DLNA_FILE = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 RELAY_CHUNK = 64 * 1024
+# TVs parse a file (MKV cues, MP4 atoms) with many tiny open-ended range
+# requests a few KB apart, plus jumps to the middle and the end. Reopening
+# the provider connection (a redirect round trip) for each would take
+# minutes, so a file relay keeps one upstream connection and a window of the
+# bytes it already fetched; only real jumps reopen.
+CACHE_BYTES = 8 * 1024 * 1024
+SKIP_BYTES = 4 * 1024 * 1024  # read-and-discard rather than reopen for jumps this small
+CLIENT_TIMEOUT = 20  # a TV that stops reading must not pin the upstream lock
 POLL_SECONDS = 3.0
 START_GRACE = 60.0  # how long the TV may sit in TRANSITIONING/STOPPED before we call it failed
 MIME = {
@@ -410,6 +418,13 @@ class Upstream:
         self.ua = ua
         self.mime = mime_for(url)
         self.size = None  # None: live / unknown length -> streamed, not seekable
+        self.opens = 0  # upstream connections made (tests, diagnostics)
+        self.events = []  # how each served range ended: (why, offset, bytes, seconds)
+        self._lock = threading.Lock()
+        self._resp = None
+        self._pos = 0  # offset the open upstream response yields next
+        self._cache = bytearray()
+        self._cache_start = 0
         self.probe()
 
     @property
@@ -425,35 +440,128 @@ class Upstream:
         if range_header and not self.live:
             headers["Range"] = range_header
         req = urllib.request.Request(self.url, headers=headers)
+        self.opens += 1
         return urllib.request.urlopen(req, timeout=timeout)  # follows redirects
 
-    def probe(self):
-        try:
-            r = urllib.request.urlopen(urllib.request.Request(
-                self.url, headers={"User-Agent": self.ua, "Range": "bytes=0-0"}), timeout=15)
-        except urllib.error.HTTPError as e:
-            e.close()
-            raise TvError(f"stream refused by provider (HTTP {e.code})", 6)
-        except (urllib.error.URLError, OSError) as e:
-            raise TvError(f"stream unreachable ({getattr(e, 'reason', e)})", 6)
-        with r:
-            ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ct.startswith("video/") or ct.startswith("audio/"):
-                if ct in ("video/mp2t", "video/mpeg2"):
-                    ct = "video/mpeg"
-                self.mime = ct
-            m = re.match(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range") or "")
-            if r.status == 206 and m:
-                self.size = int(m.group(1))
-            elif r.status == 200 and r.headers.get("Content-Length") and not self.url.lower().split("?")[0].endswith((".ts", ".m3u8")):
-                self.size = int(r.headers["Content-Length"])
-            r.read(1)
+    # -- file relay: one upstream connection, a cache window, sequential --
+
+    def _close(self):
+        if self._resp is not None:
+            try:
+                self._resp.close()
+            except OSError:
+                pass
+            self._resp = None
+
+    def _reopen(self, offset):
+        self._close()
+        r = self.open(f"bytes={offset}-" if offset else None)
+        if offset and r.status != 206:
+            r.close()
+            raise TvError("provider ignores range requests; cannot seek", 6)
+        self._resp = r
+        if offset != self._pos:  # a jump: what we cached is no longer adjacent
+            self._cache = bytearray()
+            self._cache_start = offset
+        self._pos = offset
+
+    def _read(self, n):
+        chunk = self._resp.read(n)
+        if chunk:
+            self._pos += len(chunk)
+            self._cache += chunk
+            if len(self._cache) > CACHE_BYTES:
+                drop = len(self._cache) - CACHE_BYTES
+                del self._cache[:drop]
+                self._cache_start += drop
+        return chunk
+
+    def serve(self, offset, end, write):
+        """Write bytes [offset, end] of the file to the client via write();
+        returns on EOF, at end, or when the client goes away."""
+        t0 = time.monotonic()
+        sent = [0]
+        first = offset
+
+        def counted(b):
+            write(b)
+            sent[0] += len(b)
+
+        def note(why):
+            self.events.append((why, first, sent[0], round(time.monotonic() - t0, 1)))
+            del self.events[:-40]
+        with self._lock:
+            try:
+                self._serve(offset, end, counted)
+                note("done")
+            except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError) as e:
+                note("client-gone " + type(e).__name__)
+                return  # client gone (TV closed after its tiny read): keep upstream for the next one
+            except (urllib.error.URLError, OSError) as e:
+                note("upstream-error " + repr(e)[:60])
+                self._close()
+                raise
+
+    def _serve(self, offset, end, write):
+        stalls = 0
+        cached_end = self._cache_start + len(self._cache)
+        if self._cache_start <= offset < cached_end:
+            piece = bytes(self._cache[offset - self._cache_start:cached_end])
+            if end is not None:
+                piece = piece[:end - offset + 1]
+            write(piece)
+            offset += len(piece)
+            if end is not None and offset > end:
+                return
+        if self._resp is None or offset < self._pos or offset > self._pos + SKIP_BYTES:
+            self._reopen(offset)
+        while self._pos < offset:  # small forward jump: skip through
+            if not self._read(min(RELAY_CHUNK, offset - self._pos)):
+                self._reopen(offset)
+        while True:
+            want = RELAY_CHUNK if end is None else min(RELAY_CHUNK, end - self._pos + 1)
+            if want <= 0:
+                return
+            chunk = self._read(want)
+            if not chunk:
+                self._close()
+                if end is not None and self._pos > end:
+                    return
+                # Edge servers hand out a file in slices and hang up between
+                # them; players reconnect at the next byte, and so do we,
+                # invisibly to the TV.
+                stalls += 1
+                if stalls > 5:
+                    raise ConnectionError(f"provider keeps ending the stream at {self._pos}")
+                self._reopen(self._pos)
+                continue
+            stalls = 0
+            write(chunk)
+
+
+def parse_range(header, size):
+    """'bytes=a-b' -> (a, b) clamped to the file, None when absent/invalid."""
+    m = re.match(r"bytes=(\d*)-(\d*)$", (header or "").strip())
+    if not m or not size:
+        return None
+    a, b = m.group(1), m.group(2)
+    if a == "" and b == "":
+        return None
+    if a == "":  # suffix: last b bytes
+        n = min(int(b), size)
+        return (size - n, size - 1)
+    start = int(a)
+    stop = min(int(b), size - 1) if b else size - 1
+    if start >= size or start > stop:
+        return None
+    return (start, stop)
 
 
 class RelayHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "omarchy-iptv/1.0 DLNADOC/1.50 UPnP/1.0"
     sys_version = ""
+    timeout = CLIENT_TIMEOUT
 
     def log_message(self, *a):
         pass
@@ -486,9 +594,14 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         if not self._ok_path():
             self.send_error(404)
             return
-        rng = self.headers.get("Range") if not up.live else None
+        if up.live:
+            self._get_live(up)
+        else:
+            self._get_file(up)
+
+    def _get_live(self, up):
         try:
-            r = up.open(rng)
+            r = up.open()
         except urllib.error.HTTPError as e:
             self.send_error(502, f"provider HTTP {e.code}")
             return
@@ -496,16 +609,8 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(502, "provider unreachable")
             return
         with r:
-            if rng and r.status == 206:
-                self.send_response(206)
-                self._dlna_headers(up)
-                self.send_header("Content-Range", r.headers.get("Content-Range", ""))
-                self.send_header("Content-Length", r.headers.get("Content-Length", ""))
-            else:
-                self.send_response(200)
-                self._dlna_headers(up)
-                if not up.live:
-                    self.send_header("Content-Length", str(up.size))
+            self.send_response(200)
+            self._dlna_headers(up)
             self.end_headers()
             self.server.served += 1
             try:
@@ -516,6 +621,26 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass  # TV closed the connection: normal on stop / channel change
+
+    def _get_file(self, up):
+        rng = parse_range(self.headers.get("Range"), up.size)
+        if rng:
+            start, stop = rng
+            self.send_response(206)
+            self._dlna_headers(up)
+            self.send_header("Content-Range", f"bytes {start}-{stop}/{up.size}")
+            self.send_header("Content-Length", str(stop - start + 1))
+        else:
+            start, stop = 0, up.size - 1
+            self.send_response(200)
+            self._dlna_headers(up)
+            self.send_header("Content-Length", str(up.size))
+        self.end_headers()
+        self.server.served += 1
+        try:
+            up.serve(start, stop, self.wfile.write)
+        except (urllib.error.URLError, OSError):
+            pass  # mid-stream provider failure: the TV sees a short body and retries
 
 
 class RelayServer(http.server.ThreadingHTTPServer):
@@ -621,9 +746,19 @@ def watch_playback(ctl, poll=POLL_SECONDS, grace=START_GRACE, stop_event=None):
     started = time.monotonic()
     played = False
     idle = 0
+    misses = 0
     while not (stop_event and stop_event.is_set()):
         time.sleep(poll)
-        info = soap_call(ctl, "GetTransportInfo", {"InstanceID": 0})
+        try:
+            info = soap_call(ctl, "GetTransportInfo", {"InstanceID": 0})
+        except TvError as e:
+            # A TV busy scanning a big file can stop answering UPnP for a
+            # while; only a sustained silence counts as gone.
+            misses += 1
+            if e.code != 4 or misses >= 10:
+                raise
+            continue
+        misses = 0
         state = info.get("CurrentTransportState", "")
         status = info.get("CurrentTransportStatus", "")
         if state in ("PLAYING", "PAUSED_PLAYBACK", "RECORDING"):

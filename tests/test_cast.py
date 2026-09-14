@@ -262,6 +262,8 @@ class Relay(unittest.TestCase):
                 if m:
                     a = int(m.group(1))
                     b = int(m.group(2)) if m.group(2) else len(data) - 1
+                    if self.path == "/sliced.mp4":  # edge-server style: at most 3000 bytes per connection
+                        b = min(b, a + 2999)
                     body = data[a:b + 1]
                     self.send_response(206)
                     self.send_header("Content-Range", f"bytes {a}-{b}/{len(data)}")
@@ -332,6 +334,53 @@ class Relay(unittest.TestCase):
         st, h, body = self.fetch(url, headers={"Range": "bytes=0-"})  # ranges ignored on live
         self.assertEqual(st, 200)
         self.assertEqual(body, b"G" * 188 * 5)
+
+    def test_tv_style_scan_reuses_one_upstream_connection(self):
+        # A TV parses a file with open-ended ranges a few KB apart and jumps
+        # to the end; that must not reopen the provider each time.
+        srv, up, url = self.relay("/movie.mp4")
+        before = len(self.hits)
+        got = []
+        for start in (0, 2048, 4096, 6144, 8192):
+            st, h, body = self.fetch(url, headers={"Range": f"bytes={start}-"})
+            self.assertEqual(st, 206)
+            self.assertEqual(h["Content-Range"], f"bytes {start}-{len(self.file)-1}/{len(self.file)}")
+            self.assertEqual(body, self.file[start:])
+            got.append(len(body))
+        self.assertEqual(len(self.hits) - before, 1, "sequential reads must share one upstream connection")
+        st, _, body = self.fetch(url, headers={"Range": "bytes=-128"})  # suffix range: the tail
+        self.assertEqual(st, 206)
+        self.assertEqual(body, self.file[-128:])
+        st, _, body = self.fetch(url, headers={"Range": "bytes=100-199"})  # bounded, back at the start
+        self.assertEqual((st, body), (206, self.file[100:200]))
+
+    def test_sliced_provider_is_stitched_back_together(self):
+        # The provider ends each connection after a slice; the TV must still
+        # receive the whole range in one response.
+        srv, up, url = self.relay("/sliced.mp4")
+        self.assertEqual(up.size, len(self.file))
+        before = up.opens
+        st, h, body = self.fetch(url, headers={"Range": "bytes=100-"})
+        self.assertEqual(st, 206)
+        self.assertEqual(h["Content-Length"], str(len(self.file) - 100))
+        self.assertEqual(body, self.file[100:])
+        self.assertGreater(up.opens - before, 2)
+        st, _, body = self.fetch(url)
+        self.assertEqual((st, body), (200, self.file))
+
+    def test_bad_range_is_answered_with_the_whole_file(self):
+        srv, up, url = self.relay("/movie.mp4")
+        st, h, body = self.fetch(url, headers={"Range": "bytes=999999999-"})
+        self.assertEqual((st, body), (200, self.file))
+
+    def test_parse_range(self):
+        self.assertEqual(cast.parse_range("bytes=0-", 100), (0, 99))
+        self.assertEqual(cast.parse_range("bytes=10-19", 100), (10, 19))
+        self.assertEqual(cast.parse_range("bytes=90-500", 100), (90, 99))
+        self.assertEqual(cast.parse_range("bytes=-10", 100), (90, 99))
+        self.assertIsNone(cast.parse_range("bytes=100-", 100))
+        self.assertIsNone(cast.parse_range("", 100))
+        self.assertIsNone(cast.parse_range("bytes=0-", None))
 
     def test_redirect_is_followed_by_the_relay(self):
         srv, up, url = self.relay("/redir")
