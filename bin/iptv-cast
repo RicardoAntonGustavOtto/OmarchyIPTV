@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Stream to a TV on the same network over DLNA/UPnP (AVTransport).
+
+Samsung Smart TVs (and most other TVs, receivers, and media boxes) expose a
+UPnP MediaRenderer. We hand it the stream URL; the TV fetches and decodes the
+stream itself, so nothing is routed through this machine.
+
+  iptv-cast --discover                     JSON list of renderers on the LAN
+  iptv-cast --select --location <desc-url> remember one (~/.config/omarchy-iptv/tv.json)
+  iptv-cast --select --host <ip>           same, for a Samsung TV by address
+  iptv-cast --forget
+  iptv-cast --play --id <id> [--title <t>] send a stream from the catalog
+  iptv-cast --play <url> [--title <t>]
+  iptv-cast --stop | --pause | --resume | --status
+
+Discovery uses SSDP multicast first; because a host firewall commonly drops
+the unicast replies, it also probes the local subnets for the Samsung DLNA
+renderer port (9197, 7676 on older sets) so a Samsung TV is found either way.
+
+Stream URLs carry the provider credentials; they never appear on stderr
+(redacted to <url>) and never enter the shell (QML passes ids, not URLs).
+
+Exit codes: 2 usage · 3 no TV selected · 4 TV unreachable · 5 TV refused
+(UPnP fault) · 6 stream id unknown.
+"""
+
+import argparse
+import concurrent.futures
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy-iptv")
+TV_JSON = os.path.join(CONFIG_DIR, "tv.json")
+CACHE = os.path.expanduser("~/.cache/omarchy-iptv")
+RENDERERS_JSON = os.path.join(CACHE, "renderers.json")
+SYNC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iptv-sync")
+
+USER_AGENT = "omarchy-iptv/1.0 UPnP/1.0 DLNADOC/1.50"
+SSDP_ADDR = ("239.255.255.250", 1900)
+RENDERER_ST = "urn:schemas-upnp-org:device:MediaRenderer:1"
+AVT_TYPE = "urn:schemas-upnp-org:service:AVTransport:1"
+NS_DEV = "urn:schemas-upnp-org:device-1-0"
+NS_SOAP = "http://schemas.xmlsoap.org/soap/envelope/"
+NS_CTL = "urn:schemas-upnp-org:control-1-0"
+SAMSUNG_PROBES = [(9197, ["/dmr"]), (7676, ["/smp_%d_" % n for n in range(2, 8)])]
+SKIP_IFACES = re.compile(r"^(lo|docker|veth|virbr|waydroid|br-|tun|tap|wg|tailscale|vboxnet|vmnet)")
+MAX_HOSTS = 1024
+DESC_TIMEOUT = 3
+SOAP_TIMEOUT = 15
+# Samsung sets pop up "Allow device?" on first contact and hold the request
+# until the remote answers, so the first call gets a long leash.
+FIRST_CONTACT_TIMEOUT = 45
+DEFAULT_LIVE_FORMAT = "ts"
+MIME = {
+    ".ts": "video/mpeg",
+    ".m3u8": "application/vnd.apple.mpegurl",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mpg": "video/mpeg",
+    ".mpeg": "video/mpeg",
+    ".wmv": "video/x-ms-wmv",
+    ".flv": "video/x-flv",
+}
+
+
+# --- output ------------------------------------------------------------------
+
+def redact(text):
+    return re.sub(r"https?://\S+", "<url>", str(text))
+
+
+def warn(msg):
+    print(redact(msg), file=sys.stderr)
+
+
+def die(msg, code=1):
+    warn(msg)
+    sys.exit(code)
+
+
+class TvError(Exception):
+    def __init__(self, msg, code=4):
+        super().__init__(msg)
+        self.code = code
+
+
+# --- config -----------------------------------------------------------------
+
+def load_tv():
+    try:
+        with open(TV_JSON, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# --- device descriptions ----------------------------------------------------
+
+def http_get(url, timeout=DESC_TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(1 << 20)
+
+
+def parse_description(xml_bytes, location):
+    """Renderer summary from a UPnP device description, or None if it has no
+    AVTransport service (a media server, a router, ...)."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return None
+    ns = {"d": NS_DEV}
+    base = location
+    ub = root.find("d:URLBase", ns)
+    if ub is not None and (ub.text or "").strip():
+        base = ub.text.strip()
+    devices = root.findall(".//d:device", ns)
+    for dev in devices:
+        dtype = (dev.findtext("d:deviceType", "", ns) or "")
+        control = None
+        for svc in dev.findall("d:serviceList/d:service", ns):
+            if (svc.findtext("d:serviceType", "", ns) or "").startswith("urn:schemas-upnp-org:service:AVTransport:"):
+                control = svc.findtext("d:controlURL", "", ns) or ""
+                break
+        if control is None:
+            continue
+        if "MediaRenderer" not in dtype and "AVTransport" not in control:
+            continue
+        host = urllib.parse.urlsplit(location).hostname or ""
+        return {
+            "name": (dev.findtext("d:friendlyName", "", ns) or host).strip(),
+            "manufacturer": (dev.findtext("d:manufacturer", "", ns) or "").strip(),
+            "model": (dev.findtext("d:modelName", "", ns) or "").strip(),
+            "udn": (dev.findtext("d:UDN", "", ns) or "").strip(),
+            "location": location,
+            "control_url": urllib.parse.urljoin(base, control),
+            "host": host,
+        }
+    return None
+
+
+def describe(location):
+    try:
+        return parse_description(http_get(location), location)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+# --- discovery --------------------------------------------------------------
+
+def ssdp_search(wait=1.5):
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR[0]}:{SSDP_ADDR[1]}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 1\r\n"
+        f"ST: {RENDERER_ST}\r\n"
+        f"USER-AGENT: {USER_AGENT}\r\n\r\n"
+    ).encode()
+    locations = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        s.settimeout(0.3)
+        for _ in range(2):
+            s.sendto(msg, SSDP_ADDR)
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            try:
+                data, _ = s.recvfrom(65535)
+            except socket.timeout:
+                continue
+            m = re.search(rb"(?im)^location:\s*(\S+)", data)
+            if m:
+                loc = m.group(1).decode(errors="replace")
+                if loc not in locations:
+                    locations.append(loc)
+        s.close()
+    except OSError:
+        pass
+    return locations
+
+
+def local_networks():
+    nets = []
+    try:
+        ifaces = socket.if_nameindex()
+    except OSError:
+        return nets
+    for _, name in ifaces:
+        if SKIP_IFACES.match(name):
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            req = struct.pack("256s", name.encode()[:15])
+            addr = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, req)[20:24])   # SIOCGIFADDR
+            mask = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x891B, req)[20:24])   # SIOCGIFNETMASK
+        except OSError:
+            continue
+        finally:
+            s.close()
+        try:
+            net = ipaddress.IPv4Network(f"{addr}/{mask}", strict=False)
+        except ValueError:
+            continue
+        if net.num_addresses > MAX_HOSTS:  # shrink a huge subnet to the /22 around us
+            net = ipaddress.IPv4Network(f"{addr}/22", strict=False)
+        nets.append((net, addr))
+    return nets
+
+
+def _tcp_open(ip, port, timeout=0.35):
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def probe_samsung(nets=None):
+    """Find Samsung DLNA renderers by their well-known ports; works when the
+    firewall eats SSDP replies. Returns description URLs."""
+    nets = local_networks() if nets is None else nets
+    targets = []
+    for net, me in nets:
+        for h in net.hosts():
+            ip = str(h)
+            if ip != me:
+                targets.append(ip)
+    if not targets:
+        return []
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=128) as ex:
+        futs = {ex.submit(_tcp_open, ip, port): (ip, port, paths)
+                for ip in targets for port, paths in SAMSUNG_PROBES}
+        for f in concurrent.futures.as_completed(futs):
+            if f.result():
+                found.append(futs[f])
+    locations = []
+    for ip, port, paths in sorted(found):
+        for p in paths:
+            loc = f"http://{ip}:{port}{p}"
+            try:
+                if b"MediaRenderer" in http_get(loc, timeout=1.5):
+                    locations.append(loc)
+                    break
+            except (urllib.error.URLError, OSError, ValueError):
+                continue
+    return locations
+
+
+def discover():
+    seen = {}
+    for loc in ssdp_search() + probe_samsung():
+        if loc in seen:
+            continue
+        d = describe(loc)
+        if d:
+            seen[loc] = d
+    out = []
+    udns = set()
+    for d in seen.values():
+        key = d["udn"] or d["location"]
+        if key in udns:
+            continue
+        udns.add(key)
+        out.append(d)
+    out.sort(key=lambda d: (d["name"].lower(), d["host"]))
+    try:
+        save_json(RENDERERS_JSON, out)
+    except OSError:
+        pass
+    return out
+
+
+# --- SOAP --------------------------------------------------------------------
+
+def soap_call(control_url, action, args=None, timeout=SOAP_TIMEOUT):
+    body = "".join(f"<{k}>{escape(str(v))}</{k}>" for k, v in (args or {}).items())
+    env = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<s:Envelope xmlns:s="{NS_SOAP}" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        f'<s:Body><u:{action} xmlns:u="{AVT_TYPE}">{body}</u:{action}></s:Body></s:Envelope>'
+    )
+    req = urllib.request.Request(control_url, data=env.encode("utf-8"), headers={
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": f'"{AVT_TYPE}#{action}"',
+        "User-Agent": USER_AGENT,
+        "Connection": "close",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return parse_soap_response(r.read(1 << 20), action)
+    except urllib.error.HTTPError as e:
+        with e:
+            fault = soap_fault(e.read(1 << 20))
+        raise TvError(f"TV refused {action}: {fault or f'HTTP {e.code}'}", 5)
+    except (urllib.error.URLError, OSError) as e:
+        raise TvError(f"TV unreachable ({getattr(e, 'reason', e)})", 4)
+
+
+def soap_fault(xml_bytes):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return ""
+    code = root.findtext(f".//{{{NS_CTL}}}errorCode", "") or ""
+    desc = root.findtext(f".//{{{NS_CTL}}}errorDescription", "") or ""
+    fault = root.findtext(f".//{{{NS_SOAP}}}Fault/faultstring", "") or ""
+    parts = [p for p in (f"error {code}" if code else "", desc, fault if not desc else "") if p]
+    return " ".join(parts)
+
+
+def parse_soap_response(xml_bytes, action):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return {}
+    resp = root.find(f".//{{{AVT_TYPE}}}{action}Response")
+    if resp is None:
+        return {}
+    return {child.tag.split("}")[-1]: (child.text or "").strip() for child in resp}
+
+
+# --- play ---------------------------------------------------------------------
+
+def mime_for(url):
+    path = urllib.parse.urlsplit(url).path
+    ext = os.path.splitext(path)[1].lower()
+    return MIME.get(ext, "video/mpeg")
+
+
+def tv_stream_url(url, live_format=DEFAULT_LIVE_FORMAT):
+    """Xtream live streams are cached as HLS (.m3u8) for mpv; the same stream
+    is served as plain MPEG-TS, which TVs' DLNA players handle far more
+    reliably. Anything else passes through untouched."""
+    if live_format == "ts":
+        return re.sub(r"^(https?://[^/]+/live/[^/]+/[^/]+/[^/?#]+)\.m3u8(?=$|\?)", r"\1.ts", url)
+    return url
+
+
+def didl_metadata(url, title):
+    mime = mime_for(url)
+    return (
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:sec="http://www.sec.co.kr/">'
+        '<item id="0" parentID="-1" restricted="1">'
+        f"<dc:title>{escape(title)}</dc:title>"
+        "<upnp:class>object.item.videoItem</upnp:class>"
+        f'<res protocolInfo="http-get:*:{mime}:*">{escape(url)}</res>'
+        "</item></DIDL-Lite>"
+    )
+
+
+def resolve_url(sid):
+    try:
+        p = subprocess.run([SYNC, "--play-url", "--id", str(sid)],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise TvError(f"could not resolve stream: {e}", 6)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise TvError(f"could not resolve stream: {p.stderr.strip() or 'unknown id'}", 6)
+    return p.stdout.strip()
+
+
+def require_tv():
+    tv = load_tv()
+    if not tv.get("control_url"):
+        raise TvError("no TV selected (Setup → Stream to TV → Find TVs)", 3)
+    return tv
+
+
+def cast(url, title):
+    tv = require_tv()
+    url = tv_stream_url(url, tv.get("live_format") or DEFAULT_LIVE_FORMAT)
+    ctl = tv["control_url"]
+    try:  # a renderer mid-playback may reject a new URI until stopped
+        soap_call(ctl, "Stop", {"InstanceID": 0}, timeout=FIRST_CONTACT_TIMEOUT)
+    except TvError as e:
+        if e.code == 4:
+            raise
+    soap_call(ctl, "SetAVTransportURI", {
+        "InstanceID": 0,
+        "CurrentURI": url,
+        "CurrentURIMetaData": didl_metadata(url, title),
+    }, timeout=FIRST_CONTACT_TIMEOUT)
+    soap_call(ctl, "Play", {"InstanceID": 0, "Speed": "1"})
+
+
+def transport(action):
+    tv = require_tv()
+    args = {"InstanceID": 0}
+    if action == "Play":
+        args["Speed"] = "1"
+    return soap_call(tv["control_url"], action, args)
+
+
+def status():
+    tv = require_tv()
+    info = soap_call(tv["control_url"], "GetTransportInfo", {"InstanceID": 0})
+    out = {
+        "tv": tv.get("name", ""),
+        "state": info.get("CurrentTransportState", ""),
+        "status": info.get("CurrentTransportStatus", ""),
+    }
+    try:
+        pos = soap_call(tv["control_url"], "GetPositionInfo", {"InstanceID": 0})
+        out["position"] = pos.get("RelTime", "")
+        out["duration"] = pos.get("TrackDuration", "")
+    except TvError:
+        pass
+    return out
+
+
+def select(location=None, host=None):
+    cands = [location] if location else []
+    if host:
+        cands += [f"http://{host}:{port}{p}" for port, paths in SAMSUNG_PROBES for p in paths]
+    for loc in cands:
+        d = describe(loc)
+        if d:
+            prev = load_tv()
+            d["live_format"] = prev.get("live_format") or DEFAULT_LIVE_FORMAT
+            d["cast_mode"] = True  # picking a TV means: play there
+            save_json(TV_JSON, d)
+            return d
+    raise TvError("no DLNA renderer (AVTransport) found at that address", 4)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--discover", action="store_true")
+    g.add_argument("--select", action="store_true")
+    g.add_argument("--forget", action="store_true")
+    g.add_argument("--play", action="store_true")
+    g.add_argument("--stop", action="store_true")
+    g.add_argument("--pause", action="store_true")
+    g.add_argument("--resume", action="store_true")
+    g.add_argument("--status", action="store_true")
+    ap.add_argument("--location", default="", help="device description URL (with --select)")
+    ap.add_argument("--host", default="", help="TV address (with --select)")
+    ap.add_argument("--id", default="", help="catalog id (with --play)")
+    ap.add_argument("--title", default="IPTV")
+    ap.add_argument("url", nargs="?", default="")
+    a = ap.parse_args()
+    try:
+        if a.discover:
+            json.dump(discover(), sys.stdout)
+        elif a.select:
+            if not (a.location or a.host):
+                die("--select needs --location or --host", 2)
+            d = select(a.location, a.host)
+            json.dump(d, sys.stdout)
+        elif a.forget:
+            try:
+                os.remove(TV_JSON)
+            except FileNotFoundError:
+                pass
+        elif a.play:
+            url = resolve_url(a.id) if a.id else a.url
+            if not url:
+                die("--play needs --id <id> or a url", 2)
+            cast(url, a.title)
+        elif a.stop:
+            transport("Stop")
+        elif a.pause:
+            transport("Pause")
+        elif a.resume:
+            transport("Play")
+        elif a.status:
+            json.dump(status(), sys.stdout)
+    except TvError as e:
+        die(str(e), e.code)
+
+
+if __name__ == "__main__":
+    main()

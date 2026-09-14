@@ -48,7 +48,21 @@ Item {
 
   property var favorites: []
 
-  readonly property bool playing: playProc.running
+  readonly property bool playing: playProc.running || root.casting
+
+  // Stream to TV: a DLNA/UPnP renderer picked in Setup (bin/iptv-cast). With
+  // castMode on, rows play on the TV instead of in mpv; the TV fetches the
+  // stream itself, so only the catalog id ever leaves the shell.
+  property var tv: ({})
+  readonly property bool tvConfigured: !!(tv && tv.control_url)
+  readonly property string tvName: tv && tv.name ? String(tv.name) : ""
+  property bool castMode: false
+  property bool casting: false
+  property string castTitle: ""
+  property var renderers: []
+  property bool discovering: false
+  property bool castBusy: false
+  property string tvError: ""
 
   property int epgRefreshMs: 5 * 60 * 1000
 
@@ -66,6 +80,9 @@ Item {
   }
   function playHelperPath() {
     return fileFromUrl(Qt.resolvedUrl("bin/iptv-play").toString())
+  }
+  function castHelperPath() {
+    return fileFromUrl(Qt.resolvedUrl("bin/iptv-cast").toString())
   }
 
   Component.onCompleted: loadAll()
@@ -109,6 +126,12 @@ Item {
 
   function play(id, title) {
     if (!id) return
+    if (root.castMode && root.tvConfigured) root.cast(id, title)
+    else root.playLocal(id, title)
+  }
+
+  function playLocal(id, title) {
+    if (!id) return
     var cmd = [root.playHelperPath(), "--id", String(id), "--title", title || "IPTV"]
     root.statusLine = title || "Playing"
     if (playProc.running) {
@@ -126,10 +149,68 @@ Item {
     playProc.pendingCommand = null
     playProc.stopRequested = true
     playProc.running = false
+    if (root.casting || castProc.running) root.castStop()
+  }
+
+  function setCastMode(on) {
+    root.castMode = !!on && root.tvConfigured
+    if (!root.tvConfigured) return
+    var cfg = root.tv || ({})
+    if (!!cfg.cast_mode === root.castMode) return
+    cfg.cast_mode = root.castMode
+    root.tv = cfg
+    tvFile.setText(JSON.stringify(cfg, null, 1) + "\n")
+  }
+
+  function cast(id, title) {
+    if (!id || !root.tvConfigured) return
+    if (castProc.running) castProc.running = false
+    root.castTitle = title || "IPTV"
+    root.tvError = ""
+    root.castBusy = true
+    root.statusLine = "TV ▶ " + root.castTitle + "…"
+    castProc.command = [root.castHelperPath(), "--play", "--id", String(id), "--title", root.castTitle]
+    castProc.running = true
+  }
+
+  function castStop() {
+    if (castProc.running) castProc.running = false
+    root.casting = false
+    root.castBusy = false
+    root.updateStatus()
+    if (castCtlProc.running) castCtlProc.running = false
+    castCtlProc.command = [root.castHelperPath(), "--stop"]
+    castCtlProc.running = true
+  }
+
+  function discoverTvs() {
+    if (discoverProc.running) return
+    root.tvError = ""
+    root.discovering = true
+    discoverProc.running = true
+  }
+
+  function selectTv(r) {
+    if (!r || !r.location || selectProc.running) return
+    root.tvError = ""
+    selectProc.command = [root.castHelperPath(), "--select", "--location", String(r.location)]
+    selectProc.running = true
+  }
+
+  function forgetTv() {
+    if (root.casting) root.castStop()
+    root.castMode = false
+    root.tv = ({})
+    if (!forgetProc.running) forgetProc.running = true
   }
 
   function playChannel(ch) {
     if (ch && ch.id && ch.available !== false) root.play(ch.id, ch.name)
+  }
+
+  function lastLine(text, fallback) {
+    var lines = String(text || "").trim().split("\n").filter(function(l) { return l.trim() !== "" })
+    return lines.length ? lines[lines.length - 1] : fallback
   }
 
   function requestVod(group, query) {
@@ -259,6 +340,70 @@ Item {
         root.updateStatus()
       }
     }
+  }
+
+  Process {
+    id: castProc
+    running: false
+    command: []
+    stderr: StdioCollector { id: castErr; waitForEnd: true }
+    onExited: function(code, status) {
+      root.castBusy = false
+      if (status === 0 && code === 0) {
+        root.casting = true
+        root.statusLine = "TV ▶ " + root.castTitle
+      } else if (status === 0) {
+        root.casting = false
+        var why = root.redact(root.lastLine(castErr.text, "exit " + code), "")
+        root.tvError = "TV playback failed (" + root.castTitle + "): " + why
+        root.lastError = root.tvError
+        root.statusLine = "TV failed: " + root.castTitle
+      }
+    }
+  }
+
+  Process {
+    id: castCtlProc
+    running: false
+    command: []
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: discoverProc
+    running: false
+    command: [root.castHelperPath(), "--discover"]
+    stdout: StdioCollector { id: discoverOut; waitForEnd: true }
+    stderr: StdioCollector { id: discoverErr; waitForEnd: true }
+    onExited: function(code) {
+      root.discovering = false
+      var rows = []
+      try { rows = JSON.parse(discoverOut.text || "[]") } catch (e) { rows = [] }
+      root.renderers = Array.isArray(rows) ? rows : []
+      if (code !== 0) root.tvError = "TV search failed: " + root.redact(root.lastLine(discoverErr.text, "exit " + code), "")
+      else if (!root.renderers.length) root.tvError = "No TV found. Make sure it is on and on the same network."
+    }
+  }
+
+  Process {
+    id: selectProc
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: selectErr; waitForEnd: true }
+    onExited: function(code) {
+      if (code === 0) {
+        tvFile.reload()
+      } else {
+        root.tvError = "Could not use that TV: " + root.redact(root.lastLine(selectErr.text, "exit " + code), "")
+      }
+    }
+  }
+
+  Process {
+    id: forgetProc
+    running: false
+    command: [root.castHelperPath(), "--forget"]
   }
 
   Process {
@@ -504,6 +649,22 @@ Item {
     running: true
     repeat: true
     onTriggered: root.refreshStatus()
+  }
+
+  FileView {
+    id: tvFile
+    path: root.configDir + "/tv.json"
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var v = JSON.parse(text() || "{}")
+        root.tv = (v && typeof v === "object") ? v : ({})
+      } catch (e) { root.tv = ({}) }
+      root.castMode = root.tvConfigured && root.tv.cast_mode === true
+    }
+    onLoadFailed: { root.tv = ({}); root.castMode = false }
   }
 
   FileView {

@@ -31,6 +31,14 @@ Panel {
   readonly property string lastError: service ? service.lastError : ""
   readonly property var syncStatus: service && service.status ? service.status : ({})
   readonly property bool providerConfigured: !!(syncStatus && syncStatus.provider)
+  readonly property bool tvConfigured: service ? service.tvConfigured === true : false
+  readonly property string tvName: service ? service.tvName : ""
+  readonly property string tvModel: service && service.tv && service.tv.model ? String(service.tv.model) : ""
+  readonly property string tvUdn: service && service.tv && service.tv.udn ? String(service.tv.udn) : ""
+  readonly property bool castMode: service ? service.castMode === true : false
+  readonly property var renderers: service ? service.renderers : []
+  readonly property bool discovering: service ? service.discovering === true : false
+  readonly property string tvError: service ? service.tvError : ""
 
   property string formType: "xtream"
   property string formHost: ""
@@ -208,6 +216,11 @@ Panel {
   function openOverlay() {
     if (hostWidget && hostWidget.openOverlay) hostWidget.openOverlay()
   }
+  function toggleCast() {
+    if (!service) return
+    if (!root.tvConfigured) { root.tab = "setup"; return }
+    if (service.setCastMode) service.setCastMode(!root.castMode)
+  }
 
   KeyboardPanel {
     id: panel
@@ -250,6 +263,14 @@ Panel {
             color: Color.muted
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
+          }
+          PanelActionButton {
+            iconText: "󰍹"
+            tooltipText: root.castMode ? "Playing on " + root.tvName + " — click to play in mpv again"
+              : (root.tvConfigured ? "Play on TV: " + root.tvName : "Stream to TV — pick a TV in Setup")
+            foreground: root.castMode ? Color.accent : root.contentForeground
+            fontFamily: root.contentFontFamily
+            onClicked: root.toggleCast()
           }
           PanelActionButton {
             iconText: "⛶"
@@ -526,9 +547,82 @@ Panel {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
+              text: "Stream to TV"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+            Text {
+              width: parent.width
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: "★ " + (service ? service.favorites.length : 0) + " favorites · Playback in external mpv · Password stays in the keyring"
+              text: root.tvConfigured
+                ? root.tvName + (root.tvModel ? " (" + root.tvModel + ")" : "") + " · " + (root.castMode ? "rows play on the TV" : "rows play in mpv") + " · toggle with 󰍹 in the header"
+                : "No TV selected. Finds DLNA/UPnP renderers on this network — Samsung Smart TVs and most others."
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              visible: root.tvError !== ""
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.tvError
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Row {
+              spacing: Style.space(8)
+              Button {
+                text: root.discovering ? "Searching…" : "Find TVs"
+                tooltipText: "Search this network for DLNA renderers"
+                enabled: !root.discovering
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: if (service && service.discoverTvs) service.discoverTvs()
+              }
+              Button {
+                visible: root.tvConfigured
+                text: "Forget TV"
+                tooltipText: "Drop the selected TV and play in mpv"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: if (service && service.forgetTv) service.forgetTv()
+              }
+            }
+            Repeater {
+              model: root.renderers
+              Button {
+                required property var modelData
+                width: setupCol.width
+                leftAlign: true
+                text: (modelData.name || modelData.host) + (modelData.model ? " · " + modelData.model : "") + " · " + modelData.host
+                tooltipText: root.tvUdn === modelData.udn ? "Selected" : "Use this TV"
+                selected: root.tvUdn !== "" && root.tvUdn === modelData.udn
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: if (service && service.selectTv) service.selectTv(modelData)
+              }
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "The first time, the TV asks whether to allow this computer — accept with the remote. The TV fetches the stream itself (live channels as MPEG-TS), so a provider that only accepts a special User-Agent will not play on the TV."
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "★ " + (service ? service.favorites.length : 0) + " favorites · Playback in external mpv or on the TV · Password stays in the keyring"
               color: Color.muted
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption

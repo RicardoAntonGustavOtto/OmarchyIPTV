@@ -21,6 +21,8 @@ Item {
   }
 
   property bool opened: false
+  readonly property bool castMode: svc ? svc.castMode === true : false
+  readonly property bool tvConfigured: svc ? svc.tvConfigured === true : false
   property string tab: "live"
   property string filterText: ""
   property string group: "All"
@@ -160,6 +162,9 @@ Item {
     if (root.tab === "series" && !root.openSeries) root.openShow(it)
     else svc.playChannel(it)
   }
+  function toggleCast() {
+    if (svc && svc.setCastMode && root.tvConfigured) svc.setCastMode(!root.castMode)
+  }
   function favCurrent() {
     var it = root.inEpisodes ? root.openSeries : root.selected
     if (!it || !it.id || !svc || !svc.toggleFav) return
@@ -259,6 +264,9 @@ Item {
           } else if (event.key === Qt.Key_F && (event.modifiers & Qt.ControlModifier)) {
             root.favCurrent()
             event.accepted = true
+          } else if (event.key === Qt.Key_T && (event.modifiers & Qt.ControlModifier)) {
+            root.toggleCast()
+            event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
@@ -293,6 +301,15 @@ Item {
             textFormat: Text.PlainText
             text: svc ? svc.statusLine : ""
             color: root.mutedText
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+          Text {
+            visible: root.castMode
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: "󰍹 " + (svc ? svc.tvName : "TV")
+            color: Color.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
@@ -434,7 +451,7 @@ Item {
           textFormat: Text.PlainText
           text: root.inEpisodes
             ? "↑↓ move · Enter play · Backspace back · Ctrl+F favorite show · type to filter · Esc back"
-            : "↑↓ move · ←→ group · Enter " + (root.tab === "series" ? "open" : "play") + " · Ctrl+F favorite · Tab Live/VOD/Series · type to filter · Esc close"
+            : "↑↓ move · ←→ group · Enter " + (root.tab === "series" ? "open" : "play") + " · Ctrl+F favorite" + (root.tvConfigured ? " · Ctrl+T " + (root.castMode ? "mpv" : "TV") : "") + " · Tab Live/VOD/Series · type to filter · Esc close"
           color: root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

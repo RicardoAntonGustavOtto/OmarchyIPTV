@@ -4,6 +4,7 @@ Lightweight single-provider IPTV browser for Omarchy Quattro.
 
 * **One provider**: m3u playlist **or** Xtream Codes (Live + VOD + Series)
 * **Series** (Xtream): browse or search shows by category, open one for its seasons and episodes, play an episode in mpv. The catalog syncs with everything else; a show's episodes are fetched on demand (one `get_series_info` call, cached 6 h under `~/.cache/omarchy-iptv/series/`). Favorite a show with ★. A catalog over 2000 shows asks for a group or a query first, like VOD.
+* **Stream to TV**: send any row to a Samsung Smart TV (or any DLNA/UPnP renderer) on the same network instead of mpv. See below.
 * **EPG**: XMLTV (`epg` url for m3u, `xmltv.php` for Xtream), now/next only — no week-long grids in memory
 * **Themed**: zero hardcoded colors; every surface uses `Color` / `Style` / `Border` shell tokens, so theme switches apply live
 * **Light**: QML is browser-only; playback is an external `mpv` window. Stream URLs stay out of the shell. VOD is searched on demand rather than loaded in full.
@@ -62,7 +63,7 @@ Then press 󰑓, or:
 ## Use
 
 * Left click bar icon: quick-browse panel (Live / VOD / Guide / Setup)
-* Middle click bar icon: stop mpv
+* Middle click bar icon: stop mpv / the TV
 * Right click bar icon: re-sync provider + EPG
 * ⛶ in the panel, or `omarchy-shell shell summon io.github.sam-blakeman.iptv`: fullscreen TV mode
 * Click / Enter on a row: play in external mpv
@@ -73,6 +74,35 @@ Then press 󰑓, or:
 * A stream mpv cannot open reports "Stream failed" in the bar and the mpv error in Setup
 * Setup shows cache age and EPG coverage; the provider re-syncs automatically once a day
 
+### Stream to TV
+
+Setup → **Stream to TV** → **Find TVs** lists the DLNA/UPnP renderers on your
+network (Samsung Smart TVs, most LG/Sony sets, receivers, Kodi…). Pick one;
+from then on 󰍹 in the panel header (or `Ctrl+T` in fullscreen) switches
+between playing in mpv and playing on the TV. Middle click on the bar icon
+stops the TV too. The choice survives restarts (`~/.config/omarchy-iptv/tv.json`).
+
+How it works: `bin/iptv-cast` talks UPnP AVTransport (`SetAVTransportURI` +
+`Play`) straight to the TV, which then fetches and decodes the stream by
+itself — nothing is transcoded or proxied through this machine, and the shell
+still never sees a stream URL. Live Xtream channels are handed over as MPEG-TS
+(`.ts`) rather than HLS because TV DLNA players cope with that far better;
+set `"live_format": "m3u8"` in `tv.json` if your provider only serves HLS.
+
+Things to know:
+
+* The first time, the TV asks whether to allow this computer — accept with the
+  remote (Samsung: Settings → General → External Device Manager → Device
+  Connection Manager lists it afterwards).
+* Discovery works even when a host firewall (ufw) drops SSDP replies: Samsung
+  sets are also found by probing their DLNA port (9197). Other brands behind
+  such a firewall need `bin/iptv-cast --select --location http://<tv>:<port>/<desc>.xml`
+  (or opening UDP 1900 for the LAN).
+* The TV uses its own User-Agent, so a provider that only accepts a
+  whitelisted player UA will not play on the TV.
+* `bin/iptv-cast --status` shows the TV's transport state; `--stop`,
+  `--pause`, `--resume` control it from a script.
+
 ### Favorites
 
 ☆/★ per row (or `Ctrl+F` in fullscreen). Stored as `{kind, id, name}` refs in
@@ -82,7 +112,7 @@ Then press 󰑓, or:
 ### Fullscreen TV mode
 
 Keyboard-first: ↑↓ move · ←→ group · Enter play · Ctrl+F favorite ·
-Tab Live/VOD · type to filter · Esc back out. Now/next refreshes from the
+Ctrl+T mpv/TV · Tab Live/VOD · type to filter · Esc back out. Now/next refreshes from the
 cache every 5 minutes. Themed with the `[menu]` surface tokens.
 
 ## Layout
@@ -96,9 +126,10 @@ IptvService.qml # shared singleton: data, mpv playback, favorites
 IptvModel.js    # filter/favorites helpers
 bin/iptv-sync   # python3 stdlib: m3u/Xtream fetch, XMLTV → sqlite, JSON dumps
 bin/iptv-play   # mpv wrapper (looks up stream URL by id)
+bin/iptv-cast   # python3 stdlib: DLNA discovery + AVTransport control (stream to TV)
 ```
 
-Cache: `~/.cache/omarchy-iptv/` (`channels.json`, `vod.json`, `epg.db`, mode 600).
+Cache: `~/.cache/omarchy-iptv/` (`channels.json`, `vod.json`, `epg.db`, `renderers.json`, mode 600).
 Stream URLs never leave that cache into QML.
 
 ## Remove

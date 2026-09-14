@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Sam Blakeman",
   "license": "MIT",
-  "description": "Single-provider IPTV browser for Omarchy (m3u / Xtream, Live + VOD, XMLTV EPG, favorites, fullscreen TV mode). Themed via shell tokens; playback in external mpv.",
+  "description": "Single-provider IPTV browser for Omarchy (m3u / Xtream, Live + VOD + Series, XMLTV EPG, favorites, fullscreen TV mode, stream to a DLNA TV). Themed via shell tokens; playback in external mpv or on the TV.",
   "kinds": [
     "bar-widget",
     "overlay",
