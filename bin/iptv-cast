@@ -443,6 +443,29 @@ class Upstream:
         self.opens += 1
         return urllib.request.urlopen(req, timeout=timeout)  # follows redirects
 
+    def probe(self):
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.url, headers={"User-Agent": self.ua, "Range": "bytes=0-0"}), timeout=15)
+        except urllib.error.HTTPError as e:
+            e.close()
+            raise TvError(f"stream refused by provider (HTTP {e.code})", 6)
+        except (urllib.error.URLError, OSError) as e:
+            raise TvError(f"stream unreachable ({getattr(e, 'reason', e)})", 6)
+        with r:
+            ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ct.startswith("video/") or ct.startswith("audio/"):
+                if ct in ("video/mp2t", "video/mpeg2"):
+                    ct = "video/mpeg"
+                self.mime = ct
+            m = re.match(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range") or "")
+            if r.status == 206 and m:
+                self.size = int(m.group(1))
+            elif r.status == 200 and r.headers.get("Content-Length") and not self.url.lower().split("?")[0].endswith((".ts", ".m3u8")):
+                self.size = int(r.headers["Content-Length"])
+            r.read(1)
+
+
     # -- file relay: one upstream connection, a cache window, sequential --
 
     def _close(self):
