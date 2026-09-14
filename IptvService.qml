@@ -162,19 +162,33 @@ Item {
     tvFile.setText(JSON.stringify(cfg, null, 1) + "\n")
   }
 
+  // iptv-cast --play stays alive while the TV plays (it relays the stream),
+  // exactly like the mpv process: running == playing, kill == stop.
   function cast(id, title) {
     if (!id || !root.tvConfigured) return
-    if (castProc.running) castProc.running = false
-    root.castTitle = title || "IPTV"
+    var cmd = [root.castHelperPath(), "--play", "--id", String(id), "--title", title || "IPTV"]
     root.tvError = ""
-    root.castBusy = true
-    root.statusLine = "TV ▶ " + root.castTitle + "…"
-    castProc.command = [root.castHelperPath(), "--play", "--id", String(id), "--title", root.castTitle]
-    castProc.running = true
+    root.statusLine = "TV ▶ " + (title || "IPTV") + "…"
+    if (castProc.running) {
+      castProc.pendingCommand = cmd
+      castProc.stopRequested = true
+      castProc.running = false
+    } else {
+      castProc.currentTitle = title || "IPTV"
+      castProc.command = cmd
+      castProc.running = true
+    }
   }
 
   function castStop() {
-    if (castProc.running) castProc.running = false
+    castProc.pendingCommand = null
+    if (castProc.running) {
+      castProc.stopRequested = true
+      castProc.running = false
+      return
+    }
+    // Nothing of ours is running, but the TV may still be playing (say from
+    // an earlier shell session): tell it to stop directly.
     root.casting = false
     root.castBusy = false
     root.updateStatus()
@@ -346,18 +360,41 @@ Item {
     id: castProc
     running: false
     command: []
+    property var pendingCommand: null
+    property bool stopRequested: false
+    property string currentTitle: ""
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (String(line).trim() === "PLAYING") {
+          root.castBusy = false
+          root.statusLine = "TV ▶ " + castProc.currentTitle
+        }
+      }
+    }
     stderr: StdioCollector { id: castErr; waitForEnd: true }
+    onStarted: {
+      root.casting = true
+      root.castBusy = true
+      root.castTitle = currentTitle
+    }
     onExited: function(code, status) {
+      root.casting = false
       root.castBusy = false
-      if (status === 0 && code === 0) {
-        root.casting = true
-        root.statusLine = "TV ▶ " + root.castTitle
-      } else if (status === 0) {
-        root.casting = false
+      var failed = !stopRequested && status === 0 && code !== 0
+      if (failed) {
         var why = root.redact(root.lastLine(castErr.text, "exit " + code), "")
-        root.tvError = "TV playback failed (" + root.castTitle + "): " + why
+        root.tvError = "TV playback failed (" + currentTitle + "): " + why
         root.lastError = root.tvError
-        root.statusLine = "TV failed: " + root.castTitle
+        root.statusLine = "TV failed: " + currentTitle
+      }
+      stopRequested = false
+      if (pendingCommand) {
+        command = pendingCommand
+        currentTitle = pendingCommand[5] || "IPTV"
+        pendingCommand = null
+        running = true
+      } else if (!failed) {
+        root.updateStatus()
       }
     }
   }

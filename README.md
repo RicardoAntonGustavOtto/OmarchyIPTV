@@ -83,14 +83,25 @@ between playing in mpv and playing on the TV. Middle click on the bar icon
 stops the TV too. The choice survives restarts (`~/.config/omarchy-iptv/tv.json`).
 
 How it works: `bin/iptv-cast` talks UPnP AVTransport (`SetAVTransportURI` +
-`Play`) straight to the TV, which then fetches and decodes the stream by
-itself — nothing is transcoded or proxied through this machine, and the shell
-still never sees a stream URL. Live Xtream channels are handed over as MPEG-TS
-(`.ts`) rather than HLS because TV DLNA players cope with that far better;
-set `"live_format": "m3u8"` in `tv.json` if your provider only serves HLS.
+`Play`) to the TV and, while the TV plays, relays the stream from a small
+HTTP server on this machine. That relay is needed because TVs probe a URL
+(HEAD, Range requests) and expect DLNA headers before they accept it, and
+IPTV panels do not oblige (5xx on HEAD, redirects to tokenized edge servers,
+User-Agent gates, connection resets) — the Samsung answer is UPnP error 716
+"Resource not found". The relay serves exactly one stream under a random
+path, only while playing, and fetches upstream with a player User-Agent
+(the provider's `user_agent` if set). Nothing is transcoded; the shell
+still never sees a stream URL. Live Xtream channels are handed over as
+MPEG-TS (`.ts`) rather than HLS; set `"live_format": "m3u8"` in `tv.json`
+if your provider only serves HLS. `"relay": false` hands the raw URL to the
+TV instead (works with plain file servers, not with IPTV panels).
 
 Things to know:
 
+* **Firewall**: the TV must reach the relay port (`relay_port` in
+  `tv.json`, default 8765). With ufw:
+  `sudo ufw allow from 192.168.2.0/24 to any port 8765 proto tcp comment "omarchy-iptv TV relay"`
+  (use your LAN subnet). Without it the TV times out and reports 716.
 * The first time, the TV asks whether to allow this computer — accept with the
   remote (Samsung: Settings → General → External Device Manager → Device
   Connection Manager lists it afterwards).

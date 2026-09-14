@@ -9,32 +9,48 @@ stream itself, so nothing is routed through this machine.
   iptv-cast --select --location <desc-url> remember one (~/.config/omarchy-iptv/tv.json)
   iptv-cast --select --host <ip>           same, for a Samsung TV by address
   iptv-cast --forget
-  iptv-cast --play --id <id> [--title <t>] send a stream from the catalog
-  iptv-cast --play <url> [--title <t>]
+  iptv-cast --play --id <id> [--title <t>] play a catalog stream on the TV
+  iptv-cast --play <url> [--title <t>]     (runs until the TV stops or it is killed)
   iptv-cast --stop | --pause | --resume | --status
 
 Discovery uses SSDP multicast first; because a host firewall commonly drops
 the unicast replies, it also probes the local subnets for the Samsung DLNA
 renderer port (9197, 7676 on older sets) so a Samsung TV is found either way.
 
+Playback goes through a local relay by default: TVs probe a URL with HEAD /
+Range requests and expect DLNA headers before they accept it, which IPTV
+panels do not provide (they answer HEAD with 5xx, redirect to tokenized edge
+servers, reset connections). The relay fetches the stream with a player
+User-Agent and serves it to the TV like a DLNA server would, on
+`relay_port` (tv.json, default 8765) — that port must be open to the LAN in
+the host firewall. It serves exactly one stream under a random path and
+exits when playback ends; `"relay": false` in tv.json hands the raw URL to
+the TV instead.
+
 Stream URLs carry the provider credentials; they never appear on stderr
 (redacted to <url>) and never enter the shell (QML passes ids, not URLs).
 
 Exit codes: 2 usage · 3 no TV selected · 4 TV unreachable · 5 TV refused
-(UPnP fault) · 6 stream id unknown.
+(UPnP fault) · 6 stream id unknown · 7 relay could not start · 8 TV stopped
+with an error.
 """
 
 import argparse
 import concurrent.futures
 import fcntl
+import http.server
 import ipaddress
 import json
 import os
 import re
+import secrets
+import signal
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +60,7 @@ from xml.sax.saxutils import escape
 
 CONFIG_DIR = os.path.expanduser("~/.config/omarchy-iptv")
 TV_JSON = os.path.join(CONFIG_DIR, "tv.json")
+PROVIDER_JSON = os.path.join(CONFIG_DIR, "provider.json")
 CACHE = os.path.expanduser("~/.cache/omarchy-iptv")
 RENDERERS_JSON = os.path.join(CACHE, "renderers.json")
 SYNC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iptv-sync")
@@ -64,6 +81,13 @@ SOAP_TIMEOUT = 15
 # until the remote answers, so the first call gets a long leash.
 FIRST_CONTACT_TIMEOUT = 45
 DEFAULT_LIVE_FORMAT = "ts"
+RELAY_PORT = 8765
+PLAYER_UA = "VLC/3.0.20 LibVLC/3.0.20"  # panels 403 unknown agents; a player is let through
+DLNA_LIVE = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8D100000000000000000000000000000"
+DLNA_FILE = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+RELAY_CHUNK = 64 * 1024
+POLL_SECONDS = 3.0
+START_GRACE = 60.0  # how long the TV may sit in TRANSITIONING/STOPPED before we call it failed
 MIME = {
     ".ts": "video/mpeg",
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -353,6 +377,179 @@ def parse_soap_response(xml_bytes, action):
     return {child.tag.split("}")[-1]: (child.text or "").strip() for child in resp}
 
 
+# --- relay --------------------------------------------------------------------
+
+def provider_user_agent():
+    try:
+        with open(PROVIDER_JSON, encoding="utf-8") as f:
+            ua = json.load(f).get("user_agent")
+        return ua or PLAYER_UA
+    except (OSError, ValueError, AttributeError):
+        return PLAYER_UA
+
+
+def local_ip_for(host):
+    """The address of ours that the TV can reach (the interface that routes
+    to it)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+class Upstream:
+    """What the relay serves: one stream URL, probed once so HEAD can be
+    answered without touching the provider again."""
+
+    def __init__(self, url, ua):
+        self.url = url
+        self.ua = ua
+        self.mime = mime_for(url)
+        self.size = None  # None: live / unknown length -> streamed, not seekable
+        self.probe()
+
+    @property
+    def live(self):
+        return self.size is None
+
+    @property
+    def features(self):
+        return DLNA_LIVE if self.live else DLNA_FILE
+
+    def open(self, range_header=None, timeout=20):
+        headers = {"User-Agent": self.ua, "Icy-MetaData": "0"}
+        if range_header and not self.live:
+            headers["Range"] = range_header
+        req = urllib.request.Request(self.url, headers=headers)
+        return urllib.request.urlopen(req, timeout=timeout)  # follows redirects
+
+    def probe(self):
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.url, headers={"User-Agent": self.ua, "Range": "bytes=0-0"}), timeout=15)
+        except urllib.error.HTTPError as e:
+            e.close()
+            raise TvError(f"stream refused by provider (HTTP {e.code})", 6)
+        except (urllib.error.URLError, OSError) as e:
+            raise TvError(f"stream unreachable ({getattr(e, 'reason', e)})", 6)
+        with r:
+            ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ct.startswith("video/") or ct.startswith("audio/"):
+                if ct in ("video/mp2t", "video/mpeg2"):
+                    ct = "video/mpeg"
+                self.mime = ct
+            m = re.match(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range") or "")
+            if r.status == 206 and m:
+                self.size = int(m.group(1))
+            elif r.status == 200 and r.headers.get("Content-Length") and not self.url.lower().split("?")[0].endswith((".ts", ".m3u8")):
+                self.size = int(r.headers["Content-Length"])
+            r.read(1)
+
+
+class RelayHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "omarchy-iptv/1.0 DLNADOC/1.50 UPnP/1.0"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def _ok_path(self):
+        self.server.requests.append((self.command, self.path, self.headers.get("User-Agent", ""), self.headers.get("Range", "")))
+        return self.path.split("?")[0] == self.server.relay_path
+
+    def _dlna_headers(self, up):
+        self.send_header("Content-Type", up.mime)
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", up.features)
+        self.send_header("Accept-Ranges", "none" if up.live else "bytes")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+
+    def do_HEAD(self):
+        up = self.server.upstream
+        if not self._ok_path():
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self._dlna_headers(up)
+        if not up.live:
+            self.send_header("Content-Length", str(up.size))
+        self.end_headers()
+
+    def do_GET(self):
+        up = self.server.upstream
+        if not self._ok_path():
+            self.send_error(404)
+            return
+        rng = self.headers.get("Range") if not up.live else None
+        try:
+            r = up.open(rng)
+        except urllib.error.HTTPError as e:
+            self.send_error(502, f"provider HTTP {e.code}")
+            return
+        except (urllib.error.URLError, OSError):
+            self.send_error(502, "provider unreachable")
+            return
+        with r:
+            if rng and r.status == 206:
+                self.send_response(206)
+                self._dlna_headers(up)
+                self.send_header("Content-Range", r.headers.get("Content-Range", ""))
+                self.send_header("Content-Length", r.headers.get("Content-Length", ""))
+            else:
+                self.send_response(200)
+                self._dlna_headers(up)
+                if not up.live:
+                    self.send_header("Content-Length", str(up.size))
+            self.end_headers()
+            self.server.served += 1
+            try:
+                while True:
+                    chunk = r.read(RELAY_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # TV closed the connection: normal on stop / channel change
+
+
+class RelayServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind() reverse-resolves the bind address for
+        # server_name; on 0.0.0.0 that is a 5 s DNS stall before every cast.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "omarchy-iptv"
+        self.server_port = self.server_address[1]
+
+    def __init__(self, port, upstream):
+        super().__init__(("0.0.0.0", port), RelayHandler)
+        self.upstream = upstream
+        self.relay_path = "/" + secrets.token_urlsafe(18) + "/stream" + ("." + upstream.mime.split("/")[-1])
+        self.served = 0
+        self.requests = []  # (method, path, user-agent, range): what the TV asked for
+
+
+def start_relay(url, port, tv_host):
+    ip = local_ip_for(tv_host)
+    if not ip:
+        raise TvError("no route to the TV from this machine", 4)
+    up = Upstream(url, provider_user_agent())
+    try:
+        srv = RelayServer(port, up)
+    except OSError as e:
+        raise TvError(f"relay could not listen on port {port} ({e.strerror or e})", 7)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://{ip}:{srv.server_address[1]}{srv.relay_path}", up
+
+
 # --- play ---------------------------------------------------------------------
 
 def mime_for(url):
@@ -370,8 +567,8 @@ def tv_stream_url(url, live_format=DEFAULT_LIVE_FORMAT):
     return url
 
 
-def didl_metadata(url, title):
-    mime = mime_for(url)
+def didl_metadata(url, title, mime=None, features="*"):
+    mime = mime or mime_for(url)
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -380,7 +577,7 @@ def didl_metadata(url, title):
         '<item id="0" parentID="-1" restricted="1">'
         f"<dc:title>{escape(title)}</dc:title>"
         "<upnp:class>object.item.videoItem</upnp:class>"
-        f'<res protocolInfo="http-get:*:{mime}:*">{escape(url)}</res>'
+        f'<res protocolInfo="http-get:*:{mime}:{features}">{escape(url)}</res>'
         "</item></DIDL-Lite>"
     )
 
@@ -403,10 +600,7 @@ def require_tv():
     return tv
 
 
-def cast(url, title):
-    tv = require_tv()
-    url = tv_stream_url(url, tv.get("live_format") or DEFAULT_LIVE_FORMAT)
-    ctl = tv["control_url"]
+def send_uri(ctl, url, title, mime=None, features="*"):
     try:  # a renderer mid-playback may reject a new URI until stopped
         soap_call(ctl, "Stop", {"InstanceID": 0}, timeout=FIRST_CONTACT_TIMEOUT)
     except TvError as e:
@@ -415,9 +609,74 @@ def cast(url, title):
     soap_call(ctl, "SetAVTransportURI", {
         "InstanceID": 0,
         "CurrentURI": url,
-        "CurrentURIMetaData": didl_metadata(url, title),
+        "CurrentURIMetaData": didl_metadata(url, title, mime, features),
     }, timeout=FIRST_CONTACT_TIMEOUT)
     soap_call(ctl, "Play", {"InstanceID": 0, "Speed": "1"})
+
+
+def watch_playback(ctl, poll=POLL_SECONDS, grace=START_GRACE, stop_event=None):
+    """Follow the TV's transport state until playback ends. Returns normally
+    when the TV stops after having played (remote, end of file); raises
+    TvError(8) when it never plays or stops with an error."""
+    started = time.monotonic()
+    played = False
+    idle = 0
+    while not (stop_event and stop_event.is_set()):
+        time.sleep(poll)
+        info = soap_call(ctl, "GetTransportInfo", {"InstanceID": 0})
+        state = info.get("CurrentTransportState", "")
+        status = info.get("CurrentTransportStatus", "")
+        if state in ("PLAYING", "PAUSED_PLAYBACK", "RECORDING"):
+            if not played:
+                sys.stdout.write("PLAYING\n")
+                sys.stdout.flush()
+            played = True
+            idle = 0
+            continue
+        if status and status != "OK":
+            raise TvError(f"TV stopped with {status} (it could not play this stream)", 8)
+        if state in ("STOPPED", "NO_MEDIA_PRESENT"):
+            if played:
+                idle += 1
+                if idle >= 2:
+                    return
+            elif time.monotonic() - started > grace:
+                raise TvError("TV never started playing (gave up after %ds)" % int(grace), 8)
+        elif time.monotonic() - started > grace and not played:
+            raise TvError(f"TV stuck in {state or 'unknown state'}", 8)
+
+
+def cast(url, title, relay=None, wait=True):
+    tv = require_tv()
+    url = tv_stream_url(url, tv.get("live_format") or DEFAULT_LIVE_FORMAT)
+    ctl = tv["control_url"]
+    if relay is None:
+        relay = tv.get("relay", True) is not False
+    if not relay:
+        send_uri(ctl, url, title)
+        if wait:
+            watch_playback(ctl)
+        return
+    srv, public_url, up = start_relay(url, int(tv.get("relay_port") or RELAY_PORT), tv.get("host") or urllib.parse.urlsplit(ctl).hostname)
+    stopping = threading.Event()
+
+    def on_term(*_):
+        stopping.set()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    try:
+        send_uri(ctl, public_url, title, up.mime, up.features)
+        if wait:
+            watch_playback(ctl, stop_event=stopping)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        if stopping.is_set():
+            try:
+                soap_call(ctl, "Stop", {"InstanceID": 0}, timeout=5)
+            except TvError:
+                pass
 
 
 def transport(action):
@@ -475,6 +734,8 @@ def main():
     ap.add_argument("--host", default="", help="TV address (with --select)")
     ap.add_argument("--id", default="", help="catalog id (with --play)")
     ap.add_argument("--title", default="IPTV")
+    ap.add_argument("--no-relay", action="store_true", help="hand the raw URL to the TV (no local relay)")
+    ap.add_argument("--no-wait", action="store_true", help="with --no-relay: return right after Play")
     ap.add_argument("url", nargs="?", default="")
     a = ap.parse_args()
     try:
@@ -494,7 +755,7 @@ def main():
             url = resolve_url(a.id) if a.id else a.url
             if not url:
                 die("--play needs --id <id> or a url", 2)
-            cast(url, a.title)
+            cast(url, a.title, relay=(False if a.no_relay else None), wait=not a.no_wait)
         elif a.stop:
             transport("Stop")
         elif a.pause:
