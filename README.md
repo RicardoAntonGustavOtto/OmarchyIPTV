@@ -109,8 +109,18 @@ Things to know:
   sets are also found by probing their DLNA port (9197). Other brands behind
   such a firewall need `bin/iptv-cast --select --location http://<tv>:<port>/<desc>.xml`
   (or opening UDP 1900 for the LAN).
-* The TV uses its own User-Agent, so a provider that only accepts a
-  whitelisted player UA will not play on the TV.
+* **Audio the TV cannot decode** (DTS on Samsung sets since 2018, TrueHD,
+  FLAC, Opus, Vorbis…) is converted on the fly: with `ffmpeg` installed
+  (`omarchy pkg add ffmpeg`), the relay probes the file's first audio track
+  and, when needed, copies the video and re-encodes the audio to AC3 into
+  an MPEG-TS stream. Seeking is unavailable in that mode. The first audio
+  track is used. `"transcode_audio": "always" | "auto" | "never"` in
+  `tv.json` overrides the detection (default `auto`).
+* The relay fetches with a player User-Agent (the provider's `user_agent`
+  if set), so UA-gated panels work on the TV.
+* Providers with a one-connection limit answer 4xx (this one uses 451/461)
+  while another player, or the TV, still holds the stream; stop the other
+  one first. A burst of tests can trip a short block, too.
 * `bin/iptv-cast --status` shows the TV's transport state; `--stop`,
   `--pause`, `--resume` control it from a script.
 

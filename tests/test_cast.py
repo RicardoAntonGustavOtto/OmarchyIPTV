@@ -6,6 +6,8 @@ import importlib.machinery
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -399,6 +401,107 @@ class Relay(unittest.TestCase):
         with self.assertRaises(cast.TvError) as cm:
             cast.Upstream(self.base + "/movie.mp4", "Python-urllib/3")
         self.assertEqual(cm.exception.code, 6)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+class Transcode(unittest.TestCase):
+    """DTS (or any audio the TV lacks) is converted to AC3 in MPEG-TS on the
+    fly; supported audio passes through untouched."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.files = {}
+        for name, acodec in (("dts.mkv", ["-c:a", "dca", "-strict", "-2"]), ("aac.mkv", ["-c:a", "aac"])):
+            path = os.path.join(cls.dir.name, name)
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", *acodec, "-shortest", path],
+                           check=True, timeout=60)
+            cls.files["/" + name] = open(path, "rb").read()
+        files = cls.files
+
+        class Up(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                data = files.get(self.path)
+                if data is None:
+                    self.send_error(404)
+                    return
+                m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+                if m:
+                    a = int(m.group(1))
+                    b = int(m.group(2)) if m.group(2) else len(data) - 1
+                    body = data[a:b + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {a}-{b}/{len(data)}")
+                else:
+                    body = data
+                    self.send_response(200)
+                self.send_header("Content-Type", "video/x-matroska")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Up)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.dir.cleanup()
+
+    def test_detects_audio_codecs(self):
+        self.assertEqual(cast.Upstream(self.base + "/dts.mkv", "VLC").audio_codecs(), ["dts"])
+        self.assertEqual(cast.Upstream(self.base + "/aac.mkv", "VLC").audio_codecs(), ["aac"])
+        self.assertTrue(cast.Upstream(self.base + "/dts.mkv", "VLC").needs_transcode())
+        self.assertFalse(cast.Upstream(self.base + "/aac.mkv", "VLC").needs_transcode())
+        self.assertFalse(cast.Upstream(self.base + "/dts.mkv", "VLC").needs_transcode("never"))
+        self.assertTrue(cast.Upstream(self.base + "/aac.mkv", "VLC").needs_transcode("always"))
+
+    def test_dts_is_served_as_ac3_mpegts(self):
+        old = cast.local_ip_for
+        cast.local_ip_for = lambda host: "127.0.0.1"
+        try:
+            srv, url, up, mime, feat = cast.start_relay(self.base + "/dts.mkv", 0, "127.0.0.1")
+        finally:
+            cast.local_ip_for = old
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.assertTrue(url.endswith("/converted.ts"))
+        self.assertEqual((mime, feat), ("video/mpeg", cast.DLNA_LIVE))
+        r = urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=5)
+        self.assertEqual(r.headers["Content-Type"], "video/mpeg")
+        self.assertNotIn("Content-Length", r.headers)
+        r.close()
+        body = urllib.request.urlopen(url, timeout=60).read()
+        self.assertEqual(body[0], 0x47, "MPEG-TS sync byte")
+        out = os.path.join(self.dir.name, "out.ts")
+        open(out, "wb").write(body)
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "csv=p=0", out],
+                               capture_output=True, text=True).stdout
+        self.assertIn("h264", probe)
+        self.assertIn("ac3", probe)
+        self.assertNotIn("dts", probe)
+
+    def test_supported_audio_passes_through(self):
+        old = cast.local_ip_for
+        cast.local_ip_for = lambda host: "127.0.0.1"
+        try:
+            srv, url, up, mime, feat = cast.start_relay(self.base + "/aac.mkv", 0, "127.0.0.1")
+        finally:
+            cast.local_ip_for = old
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.assertIsNone(srv.ts_path)
+        self.assertEqual(urllib.request.urlopen(url, timeout=5).read(), self.files["/aac.mkv"])
 
 
 class WatchPlayback(unittest.TestCase):
