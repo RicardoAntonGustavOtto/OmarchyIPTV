@@ -463,7 +463,7 @@ class Upstream:
                 if e.code >= 500 and attempt + 1 < PROBE_RETRIES:
                     time.sleep(1)
                     continue
-                raise TvError(f"stream refused by provider (HTTP {e.code})", 6)
+                raise TvError(f"stream refused by provider (HTTP {e.code}) — expired account or another player holding the stream? See Setup", 6)
             except (urllib.error.URLError, OSError) as e:
                 raise TvError(f"stream unreachable ({getattr(e, 'reason', e)})", 6)
         with r:

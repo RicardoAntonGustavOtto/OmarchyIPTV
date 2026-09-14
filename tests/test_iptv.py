@@ -63,6 +63,20 @@ class SlimAndMatch(unittest.TestCase):
         self.assertEqual(sync.group_names(rows), ["All", "UK", "US"])
 
 
+class AccountSummary(unittest.TestCase):
+    def test_expired_trial(self):
+        a = sync.account_summary({"status": "Expired", "exp_date": "1789401736", "is_trial": "1", "max_connections": "1"})
+        self.assertEqual(a["status"], "Expired")
+        self.assertEqual(a["exp_date"], 1789401736)
+        self.assertTrue(a["is_trial"])
+        self.assertEqual(a["max_connections"], 1)
+
+    def test_garbage_is_harmless(self):
+        a = sync.account_summary(None)
+        self.assertEqual((a["status"], a["exp_date"], a["is_trial"], a["max_connections"]), ("", 0, False, 0))
+        self.assertEqual(sync.account_summary({"exp_date": "soon", "max_connections": None})["exp_date"], 0)
+
+
 class Redact(unittest.TestCase):
     def test_redact_secret_and_urlencoded(self):
         sync.SECRETS[:] = ["p@ss"]

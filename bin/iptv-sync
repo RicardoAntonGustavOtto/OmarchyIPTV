@@ -46,6 +46,7 @@ CHANNELS_JSON = os.path.join(CACHE, "channels.json")
 VOD_JSON = os.path.join(CACHE, "vod.json")
 SERIES_JSON = os.path.join(CACHE, "series.json")
 SERIES_DIR = os.path.join(CACHE, "series")  # one <series_id>.json of episodes per show
+ACCOUNT_JSON = os.path.join(CACHE, "account.json")  # Xtream user_info summary from the last sync
 EPISODES_TTL = 6 * 3600
 EPG_DB = os.path.join(CACHE, "epg.db")
 TIMEOUT = 60
@@ -576,8 +577,33 @@ def episode_rows(info, series_id, host, q_user, q_pw, series_name=""):
     return rows
 
 
+def account_summary(user_info):
+    """The bits of Xtream user_info worth showing in Setup: an expired trial
+    refuses every stream with a bare 4xx, which otherwise looks like a bug."""
+    u = user_info if isinstance(user_info, dict) else {}
+    try:
+        exp = int(u.get("exp_date") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    try:
+        max_conn = int(u.get("max_connections") or 0)
+    except (TypeError, ValueError):
+        max_conn = 0
+    return {
+        "status": str(u.get("status") or ""),
+        "exp_date": exp,
+        "is_trial": str(u.get("is_trial") or "") == "1",
+        "max_connections": max_conn,
+        "checked_at": int(time.time()),
+    }
+
+
 def sync_xtream(prov):
     host, api, q_user, q_pw, ua = xtream_api(prov)
+    try:  # account info rides on the bare api call; never fail a sync over it
+        save_json(ACCOUNT_JSON, account_summary(fetch_json(api, ua).get("user_info")))
+    except Exception as e:  # noqa: BLE001 - informational only
+        warn(f"warning: account info unavailable ({e})")
 
     def cats(action):
         return {str(c.get("category_id")): c.get("category_name") or "Ungrouped"
@@ -865,6 +891,7 @@ def dump_status():
         "series": len(load_json(SERIES_JSON)),
         "epg_programmes": epg_count,
         "epg_until": epg_until,
+        "account": load_json(ACCOUNT_JSON) if os.path.exists(ACCOUNT_JSON) else None,
     }, sys.stdout)
 
 

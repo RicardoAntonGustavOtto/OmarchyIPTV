@@ -67,6 +67,18 @@ Panel {
     } else out += " · no EPG source"
     return out + " · auto re-sync daily"
   }
+  readonly property var account: syncStatus && syncStatus.account ? syncStatus.account : null
+  readonly property bool accountExpired: !!account && (String(account.status).toLowerCase() === "expired"
+    || (account.exp_date > 0 && account.exp_date * 1000 < Date.now()))
+  function accountSummary() {
+    var a = root.account
+    if (!a || !a.status) return ""
+    var out = "Account: " + a.status + (a.is_trial ? " (trial)" : "")
+    if (a.exp_date > 0) out += (root.accountExpired ? " · expired " : " · until ") + new Date(a.exp_date * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
+    if (a.max_connections > 0) out += " · " + a.max_connections + " connection" + (a.max_connections > 1 ? "s" : "")
+    if (root.accountExpired) out += " — the provider refuses every stream until it is renewed"
+    return out
+  }
   readonly property bool syncing: service ? service.syncing === true : false
   readonly property bool savingProvider: service ? service.savingProvider === true : false
 
@@ -454,6 +466,16 @@ Panel {
               textFormat: Text.PlainText
               text: root.statusSummary()
               color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              visible: root.accountSummary() !== ""
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.accountSummary()
+              color: root.accountExpired ? Color.urgent : Color.muted
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.bodySmall
             }
