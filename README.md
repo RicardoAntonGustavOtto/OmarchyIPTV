@@ -124,6 +124,22 @@ Things to know:
 * `bin/iptv-cast --status` shows the TV's transport state; `--stop`,
   `--pause`, `--resume` control it from a script.
 
+### Describe (for Samaritan and other front ends)
+
+```sh
+bin/iptv-sync --describe
+```
+
+prints one JSON object: the plugin's capability descriptor, protocol
+version 1 (see `~/Work/DESCRIBE.md`). It lists the row shapes the
+`--dump-*` commands emit (`channel`, `vod`, `series`, `episode`, every key
+with its type, suggested columns) and the commands a user drives, each
+marked read or write with a consequence tier for writes. A layer such as
+Samaritan reads it to present this plugin's data with no per-tool code.
+It is a static schema: it reads no config, never contacts the provider,
+and never contains a host, URL or credential. `tests/test_iptv.py` checks
+the descriptor's field names against real dumps, so the two cannot drift.
+
 ### Favorites
 
 ☆/★ per row (or `Ctrl+F` in fullscreen). Stored as `{kind, id, name}` refs in
@@ -145,7 +161,7 @@ Panel.qml       # Live/VOD/Guide/Setup
 IptvOverlay.qml # fullscreen 10-foot browser
 IptvService.qml # shared singleton: data, mpv playback, favorites
 IptvModel.js    # filter/favorites helpers
-bin/iptv-sync   # python3 stdlib: m3u/Xtream fetch, XMLTV → sqlite, JSON dumps
+bin/iptv-sync   # python3 stdlib: m3u/Xtream fetch, XMLTV → sqlite, JSON dumps, --describe
 bin/iptv-play   # mpv wrapper (looks up stream URL by id)
 bin/iptv-cast   # python3 stdlib: DLNA discovery + AVTransport control (stream to TV)
 ```

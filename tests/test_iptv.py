@@ -5,10 +5,12 @@ import importlib.machinery
 import io
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -202,6 +204,187 @@ class Series(unittest.TestCase):
                 self.assertEqual(out.getvalue(), "http://h/series/u/p/11.mp4")
             finally:
                 sync.SERIES_DIR = old
+
+
+FIELD_TYPES = {"id", "text", "money", "percent", "int", "float", "bool", "date", "datetime", "enum"}
+
+
+class Describe(unittest.TestCase):
+    """--describe is a static schema (DESCRIBE.md protocol v1). Its shape is
+    checked here, and its field names are checked against what the real
+    --dump-* commands emit after a sync from a fake Xtream panel, so the
+    descriptor cannot drift from the data."""
+
+    HOST = "http://127.0.0.1"  # the fake panel; must never leak into the descriptor
+    NOW = int(time.time())
+
+    @classmethod
+    def setUpClass(cls):
+        def ts(t):
+            return time.strftime("%Y%m%d%H%M%S", time.gmtime(t)) + " +0000"
+
+        xmltv = ("<tv><channel id=\"c1\"><display-name>One</display-name></channel>"
+                 f"<programme start=\"{ts(cls.NOW - 600)}\" stop=\"{ts(cls.NOW + 600)}\" channel=\"c1\">"
+                 "<title>Now</title></programme>"
+                 f"<programme start=\"{ts(cls.NOW + 600)}\" stop=\"{ts(cls.NOW + 1200)}\" channel=\"c1\">"
+                 "<title>Next</title></programme></tv>").encode()
+        api = {
+            "": {"user_info": {"status": "Active", "exp_date": "1789401736", "max_connections": "1"}},
+            "get_live_categories": [{"category_id": 1, "category_name": "News"}],
+            "get_vod_categories": [{"category_id": 2, "category_name": "Movies"}],
+            "get_series_categories": [{"category_id": 3, "category_name": "Drama"}],
+            "get_live_streams": [{"stream_id": 1, "name": "One", "category_id": 1,
+                                  "epg_channel_id": "c1", "stream_icon": "http://x/l.png"}],
+            "get_vod_streams": [{"stream_id": 2, "name": "Film", "category_id": 2,
+                                 "container_extension": "mkv"}],
+            "get_series": [{"series_id": 7, "name": "Show", "category_id": 3, "cover": "http://x/c",
+                            "plot": "p", "releaseDate": "2019-05-01", "rating": 8}],
+            "get_series_info": Series.INFO,
+        }
+
+        class Panel(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                q = urllib.parse.parse_qs(u.query)
+                if q.get("password") != ["pw"]:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                if u.path == "/xmltv.php":
+                    body, ctype = xmltv, "application/xml"
+                else:
+                    body = json.dumps(api[q.get("action", [""])[0]]).encode()
+                    ctype = "application/json"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Panel)
+        cls.base = f"{cls.HOST}:{cls.srv.server_port}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def run_describe(self, home):
+        p = subprocess.run([str(ROOT / "bin" / "iptv-sync"), "--describe"],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "HOME": home})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stderr, "")
+        return p.stdout
+
+    def test_prints_one_json_object_without_setup_or_side_effects(self):
+        with tempfile.TemporaryDirectory() as home:
+            out = self.run_describe(home)
+            self.assertEqual(os.listdir(home), [], "describe must not create config or cache")
+        d = json.loads(out)  # exactly one object on stdout, nothing else
+        self.assertEqual(d, sync.DESCRIBE)
+        self.assertEqual(d["tool"], "iptv")
+        self.assertEqual(d["version"], 1)
+        self.assertTrue(d["summary"])
+        for word in ("http", "://", "127.0.0.1", "password", "@"):
+            self.assertNotIn(word, out)
+
+        entities = d["entities"]
+        self.assertEqual(set(entities), {"channel", "vod", "series", "episode"})
+        for name, e in entities.items():
+            self.assertEqual(set(e), {"summary", "id", "label", "fields", "columns", "summable"}, name)
+            self.assertTrue(e["summary"])
+            self.assertIn(e["id"], e["fields"])
+            self.assertIn(e["label"], e["fields"])
+            self.assertEqual(e["fields"][e["id"]]["type"], "id")
+            self.assertTrue(set(e["columns"]) <= set(e["fields"]), name)
+            self.assertTrue(set(e["summable"]) <= set(e["fields"]), name)
+            for fname, f in e["fields"].items():
+                self.assertIn(f["type"], FIELD_TYPES, f"{name}.{fname}")
+                self.assertTrue(set(f) <= {"type", "unit", "ref", "null_ok", "values"}, f"{name}.{fname}")
+                if "ref" in f:
+                    self.assertIn(f["ref"], entities)
+
+        cmds = {c["cmd"]: c for c in d["commands"]}
+        self.assertEqual(len(cmds), len(d["commands"]), "duplicate cmd")
+        for cmd, c in cmds.items():
+            self.assertIn(c["kind"], ("read", "write"), cmd)
+            if c["kind"] == "read":
+                self.assertNotIn("writes", c, cmd)
+                self.assertNotIn("tier", c, cmd)
+                if "returns" in c:
+                    self.assertIn(c["returns"], entities, cmd)
+            else:
+                self.assertNotIn("returns", c, cmd)
+                self.assertIn(c["tier"], range(5), cmd)
+        self.assertEqual({c: cmds[c].get("returns") for c in cmds if cmds[c]["kind"] == "read"}, {
+            "iptv-sync --dump-channels": "channel",
+            "iptv-sync --dump-vod": "vod",
+            "iptv-sync --dump-series": "series",
+            "iptv-sync --dump-episodes": "episode",
+            "iptv-sync --dump-epg-now": None,
+            "iptv-cast --status": None,
+        })
+        self.assertEqual({c: cmds[c]["tier"] for c in cmds if cmds[c]["kind"] == "write"}, {
+            "iptv-cast --play": 2, "iptv-cast --stop": 2, "iptv-cast --pause": 2,
+            "iptv-cast --resume": 2, "iptv-play --id": 2, "iptv-sync --sync": 1,
+        })
+
+    def test_entity_fields_match_real_dump_keys(self):
+        from contextlib import redirect_stdout
+
+        def dump(fn, *args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                fn(*args)
+            rows = json.loads(out.getvalue())
+            self.assertTrue(rows, fn.__name__)
+            return rows
+
+        names = ("CACHE", "CHANNELS_JSON", "VOD_JSON", "SERIES_JSON", "SERIES_DIR",
+                 "ACCOUNT_JSON", "EPG_DB", "CONFIG")
+        saved = {n: getattr(sync, n) for n in names}
+        old_env = os.environ.get("IPTV_PASSWORD")
+        with tempfile.TemporaryDirectory() as d:
+            sync.CACHE = d
+            sync.CHANNELS_JSON = os.path.join(d, "channels.json")
+            sync.VOD_JSON = os.path.join(d, "vod.json")
+            sync.SERIES_JSON = os.path.join(d, "series.json")
+            sync.SERIES_DIR = os.path.join(d, "series")
+            sync.ACCOUNT_JSON = os.path.join(d, "account.json")
+            sync.EPG_DB = os.path.join(d, "epg.db")
+            sync.CONFIG = os.path.join(d, "provider.json")
+            os.environ["IPTV_PASSWORD"] = "pw"
+            prov = {"type": "xtream", "host": self.base, "username": "u"}
+            with open(sync.CONFIG, "w") as f:
+                json.dump(prov, f)
+            try:
+                self.assertEqual(sync.sync_xtream(prov), (1, 1, 1, 2))
+                emitted = {
+                    "channel": dump(sync.dump_channels, "", "All", 0),
+                    "vod": dump(sync.dump_vod, "", "Movies", 0),
+                    "series": dump(sync.dump_series, "", "All", 0),
+                    "episode": dump(sync.dump_episodes, "xcs-7"),  # get_series_info via the fake panel
+                }
+            finally:
+                for n, v in saved.items():
+                    setattr(sync, n, v)
+                sync.SECRETS[:] = []
+                if old_env is None:
+                    os.environ.pop("IPTV_PASSWORD", None)
+                else:
+                    os.environ["IPTV_PASSWORD"] = old_env
+
+        self.assertEqual(emitted["channel"][0]["epg_now"], "Now")  # the guide really was joined
+        for name, rows in emitted.items():
+            fields = set(sync.DESCRIBE["entities"][name]["fields"])
+            for row in rows:
+                self.assertEqual(set(row), fields, f"{name} row keys drifted from --describe")
+                self.assertNotIn("url", row)
 
 
 class BoundedReaderLimits(unittest.TestCase):

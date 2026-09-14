@@ -20,6 +20,12 @@ NOTE: stream URLs for Xtream embed the password (required by the
 protocol). They stay in mode-600 cache files. --dump-* for the shell
 omits urls; --play-url looks one up at play time. Error output is
 passed through redact() so a password can never reach the shell log.
+
+--describe prints the static "describe" capability descriptor (see
+DESCRIBE below): a schema of the entities the --dump-* commands emit and
+the commands a user drives, so a smart layer can present this plugin's
+data with no per-tool code. It reads nothing and never touches the
+provider.
 """
 
 import argparse
@@ -911,6 +917,112 @@ def dump_epg_now():
                         "now": cur, "next": nxt})
     json.dump(out, sys.stdout)
 
+# --- describe (capability descriptor, protocol v1) ---------------------------
+
+# One static JSON object, printed by --describe. Pure read: no provider, no
+# config, no credentials, and never a host or URL. Field names mirror the
+# keys the --dump-* commands emit after slim() (tests/test_iptv.py checks
+# them against real dumps, so a drift here is a test failure, not a
+# surprise in the layer that consumes it).
+DESCRIBE = {
+    "tool": "iptv",
+    "version": 1,
+    "summary": "single-provider IPTV browser for Omarchy: live channels, VOD, series, EPG now/next, mpv or TV playback",
+    "entities": {
+        "channel": {
+            "summary": "a live channel from the synced playlist, with EPG now/next when the guide covers it",
+            "id": "id",
+            "label": "name",
+            "fields": {
+                "id": {"type": "id"},
+                "name": {"type": "text"},
+                "group": {"type": "text"},
+                "tvg_id": {"type": "text"},
+                "epg_now": {"type": "text"},
+                "epg_next": {"type": "text"},
+            },
+            "columns": ["name", "group", "epg_now"],
+            "summable": [],
+        },
+        "vod": {
+            "summary": "a movie from the Xtream VOD catalog (empty for m3u providers)",
+            "id": "id",
+            "label": "name",
+            "fields": {
+                "id": {"type": "id"},
+                "name": {"type": "text"},
+                "group": {"type": "text"},
+                "tvg_id": {"type": "text"},
+            },
+            "columns": ["name", "group"],
+            "summable": [],
+        },
+        "series": {
+            "summary": "a show from the Xtream series catalog; its episodes come from iptv-sync --dump-episodes",
+            "id": "id",
+            "label": "name",
+            "fields": {
+                "id": {"type": "id"},
+                "series_id": {"type": "int"},
+                "name": {"type": "text"},
+                "group": {"type": "text"},
+                "plot": {"type": "text"},
+                "year": {"type": "text"},
+                "rating": {"type": "text"},
+                "tvg_id": {"type": "text"},
+            },
+            "columns": ["name", "group"],
+            "summable": [],
+        },
+        "episode": {
+            "summary": "one episode of a show, in season/episode order",
+            "id": "id",
+            "label": "name",
+            "fields": {
+                "id": {"type": "id"},
+                "name": {"type": "text"},
+                "season": {"type": "int"},
+                "episode": {"type": "int"},
+                "title": {"type": "text"},
+                "group": {"type": "text"},
+                "series_name": {"type": "text"},
+                "duration": {"type": "text"},
+                "tvg_id": {"type": "text"},
+            },
+            "columns": ["name", "duration"],
+            "summable": [],
+        },
+    },
+    "commands": [
+        {"cmd": "iptv-sync --dump-channels", "kind": "read", "returns": "channel",
+         "summary": "live channels with EPG now/next; --query, --group, --limit narrow the list"},
+        {"cmd": "iptv-sync --dump-vod", "kind": "read", "returns": "vod",
+         "summary": "VOD catalog; needs --query or --group (the full catalog is never listed)"},
+        {"cmd": "iptv-sync --dump-series", "kind": "read", "returns": "series",
+         "summary": "series catalog; --query also matches the plot, a huge catalog needs --query or --group"},
+        {"cmd": "iptv-sync --dump-episodes", "kind": "read", "returns": "episode", "args": ["id"],
+         "summary": "episodes of one show (--id xcs-<series_id>), fetched on demand and cached 6h"},
+        {"cmd": "iptv-sync --dump-epg-now", "kind": "read",
+         "summary": "now/next title for every channel with guide data"},
+        {"cmd": "iptv-cast --status", "kind": "read",
+         "summary": "transport state of the selected TV"},
+        {"cmd": "iptv-cast --play", "kind": "write", "tier": 2, "args": ["id"],
+         "summary": "play a catalog row on the selected TV"},
+        {"cmd": "iptv-cast --stop", "kind": "write", "tier": 2, "summary": "stop the TV"},
+        {"cmd": "iptv-cast --pause", "kind": "write", "tier": 2, "summary": "pause the TV"},
+        {"cmd": "iptv-cast --resume", "kind": "write", "tier": 2, "summary": "resume the TV"},
+        {"cmd": "iptv-play --id", "kind": "write", "tier": 2, "args": ["id"],
+         "summary": "play a catalog row in an mpv window"},
+        {"cmd": "iptv-sync --sync", "kind": "write", "tier": 1,
+         "summary": "re-fetch the provider catalog and EPG into the cache"},
+    ],
+}
+
+
+def describe():
+    json.dump(DESCRIBE, sys.stdout)
+    sys.stdout.write("\n")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -926,6 +1038,8 @@ def main():
     g.add_argument("--dump-ids", metavar="IDS")
     g.add_argument("--play-url", action="store_true")
     g.add_argument("--write-provider", action="store_true")
+    g.add_argument("--describe", action="store_true",
+                   help="print the static capability descriptor (JSON) and exit")
     ap.add_argument("--group", default="")
     ap.add_argument("--query", default="")
     ap.add_argument("--limit", type=int, default=0)
@@ -938,6 +1052,10 @@ def main():
     ap.add_argument("--epg", default="")
     ap.add_argument("--user-agent", default="")
     a = ap.parse_args()
+
+    if a.describe:  # pure read: before any side effect, even the config dir
+        describe()
+        return
 
     # So the shell's favorites.json write never fails on a fresh install.
     os.makedirs(CONFIG_DIR, exist_ok=True)
